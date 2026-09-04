@@ -1,0 +1,49 @@
+# CI — the gate on every push and pull request. `release.yml` runs the same
+# three commands again against the tag it packages, so nothing here replaces
+# that; this is what says so before a merge rather than after one.
+
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+
+# A second push to a branch supersedes the run still in flight on it.
+concurrency:
+    group: ci-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    check:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+
+            # The device target, for the cross build below. The host toolchain
+            # is whatever the runner ships.
+            - name: Install the cross target
+              run: rustup target add armv7-unknown-linux-musleabihf
+
+            # ~/.cargo/git holds git-pinned dependency revs.
+            - uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cargo/registry
+                      ~/.cargo/git
+                      target
+                  key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+            # `catalog`'s tests build their fixtures with the `sqlite3` binary,
+            # which ubuntu-latest ships.
+            - name: Format, lint, test
+              run: |
+                  cargo fmt --all --check
+                  cargo clippy --workspace --all-targets -- -D warnings
+                  cargo test --workspace
+
+            # The host tests say nothing about the link this actually ships:
+            # `rust-lld` and the musl crt objects, per .cargo/config.toml.
+            - name: Build for the device
+              run: cargo build --release --target armv7-unknown-linux-musleabihf
