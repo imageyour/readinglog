@@ -221,10 +221,12 @@ pub fn duration_tight(secs: i64, s: &Strings) -> String {
     }
 }
 
-/// Word counts read as "1.2M", "48k", "812".
+/// Word counts read as "1.2M", "48k", "812". The thousands break at 999 500
+/// and not at a million: the `k` form rounds, and everything above that rounds
+/// to a "1000k" that names its magnitude twice.
 pub fn words(n: i64) -> String {
     match n {
-        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        n if n >= 999_500 => format!("{:.1}M", n as f64 / 1_000_000.0),
         n if n >= 1_000 => format!("{}k", (n as f64 / 1000.0).round() as i64),
         n => n.to_string(),
     }
@@ -377,5 +379,9 @@ mod tests {
         assert_eq!(words(812), "812");
         assert_eq!(words(48_000), "48k");
         assert_eq!(words(1_200_000), "1.2M");
+        // The break sits where the thousands would round past three digits.
+        assert_eq!(words(999_499), "999k");
+        assert_eq!(words(999_500), "1.0M");
+        assert_eq!(words(1_000_000), "1.0M");
     }
 }

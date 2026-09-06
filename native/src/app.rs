@@ -46,6 +46,8 @@ pub struct App {
     colour: bool,
     /// Where the record and the archives beside it live.
     dir: std::path::PathBuf,
+    /// The framework orientation the input devices are transforming against.
+    orientation: crate::orientation::Orientation,
     /// Where every touchable thing was on the last frame.
     hits: Vec<(Hit, crate::ui::paint::Rect)>,
 }
@@ -73,6 +75,9 @@ impl App {
             stats,
             colour,
             dir: std::path::PathBuf::from(crate::store::STORE_DIR),
+            // Detected here as `Lang` and `has_cfa` are, and re-read on the
+            // idle tick: the framework can flip the panel while this is open.
+            orientation: crate::orientation::Orientation::detect(),
             state: State::new(today),
             today,
             now,
@@ -425,6 +430,23 @@ impl App {
         Ok(())
     }
 
+    /// Re-read the framework's orientation, handing a change to the input
+    /// devices.
+    ///
+    /// The X server rotates the display by itself and raw evdev coordinates
+    /// stay panel-fixed, so a flip nothing acts on leaves the screen right and
+    /// every touch on it mirrored, with the two bezel buttons the wrong way
+    /// round. Nothing is redrawn: the frame on the panel is already correct,
+    /// and a full refresh here would flash for no reason.
+    fn reorient(&mut self, input: &mut Input) {
+        let now = crate::orientation::Orientation::detect();
+        if now != self.orientation {
+            eprintln!("orientation: {:?} -> {now:?}", self.orientation);
+            self.orientation = now;
+            input.set_orientation(now);
+        }
+    }
+
     /// Run until `Action::Quit`.
     pub fn run(&mut self, fb: &mut Framebuffer, input: &mut Input) -> Result<()> {
         self.draw(fb)?;
@@ -469,9 +491,15 @@ impl App {
                         self.draw(fb)?;
                     }
                 }
-                // `pump_events` reports a repaint request.
-                InputEvent::Tick if fb.pump_events() => self.draw(fb)?,
-                _ => {}
+                InputEvent::Tick => {
+                    // The idle tick bounds how quickly a rotation reaches this
+                    // — see `eink::input::TICK_MS`.
+                    self.reorient(input);
+                    // `pump_events` reports a repaint request.
+                    if fb.pump_events() {
+                        self.draw(fb)?;
+                    }
+                }
             }
         }
     }
