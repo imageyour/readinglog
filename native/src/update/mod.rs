@@ -20,11 +20,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The instant this build was compiled and the commit it came from.
 pub const BUILD: &str = env!("READINGLOG_BUILD");
 
-/// The project, as GitHub names it.
-pub const REPO: &str = "huangziwei/readinglog";
+/// The project, as GitHub names it. This fork, not upstream: `place` replaces
+/// the binary it is running from, so upstream here would have one tap on
+/// "check for update" overwrite this build with the official one and take the
+/// patches carried on this branch with it.
+pub const REPO: &str = "imageyour/readinglog";
 
 /// Where to go on a computer when this cannot do it.
-pub const RELEASES_URL: &str = "github.com/huangziwei/readinglog/releases";
+pub const RELEASES_URL: &str = "github.com/imageyour/readinglog/releases";
 
 /// The folder `place` installs into, and the folder holding the record.
 pub const EXTENSION_DIR: &str = "/mnt/us/extensions/readinglog";
