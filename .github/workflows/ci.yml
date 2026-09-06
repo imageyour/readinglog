@@ -9,10 +9,12 @@ on:
         branches: [main]
     pull_request:
 
-# A second push to a branch supersedes the run still in flight on it.
+# A second push to a branch supersedes the run still in flight on it. Not on
+# `main`: cancelling there can leave a merged commit with no completed run
+# against it, which is the one place the answer is worth waiting for.
 concurrency:
     group: ci-${{ github.ref }}
-    cancel-in-progress: true
+    cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
     check:
@@ -26,14 +28,16 @@ jobs:
             - name: Install the cross target
               run: rustup target add armv7-unknown-linux-musleabihf
 
-            # ~/.cargo/git holds git-pinned dependency revs.
-            - uses: actions/cache@v4
+            # Not `actions/cache` over `target/`: that directory runs to
+            # gigabytes here — a debug tree, a release tree and a cross tree —
+            # against a 10 GB cap for the whole repository, and a key of the
+            # lockfile alone is written once and then never refreshed, since
+            # `actions/cache` only saves on a miss. This keys on the compiler
+            # as well as the lockfile, keeps the dependency artifacts rather
+            # than the whole tree, and prunes what a build stopped using.
+            - uses: Swatinem/rust-cache@v2
               with:
-                  path: |
-                      ~/.cargo/registry
-                      ~/.cargo/git
-                      target
-                  key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+                  key: armv7
 
             # `catalog`'s tests build their fixtures with the `sqlite3` binary,
             # which ubuntu-latest ships.
