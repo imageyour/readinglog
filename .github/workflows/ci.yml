@@ -4,9 +4,13 @@
 
 name: CI
 
+# Every branch, not just `main`: the work happens on branches here, and a gate
+# that only speaks on the default branch has nothing to say until after the
+# thing it was meant to catch has landed. A branch that also has a pull request
+# open runs twice, which on a public repository costs nothing and is the
+# cheaper mistake than not running at all.
 on:
     push:
-        branches: [main]
     pull_request:
 
 # A second push to a branch supersedes the run still in flight on it. Not on
