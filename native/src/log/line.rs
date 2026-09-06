@@ -20,41 +20,55 @@ pub struct Moment {
     pub at: String,
 }
 
-/// `YYMMDD:HHMMSS` at the start of a syslog line.
-pub fn stamp(line: &str) -> Option<Moment> {
-    let raw = line.as_bytes();
-    if raw.len() < 13 || raw[6] != b':' || !line[..6].bytes().all(|c| c.is_ascii_digit()) {
+/// The day and the seconds into it that a `YYMMDD:HHMMSS` prefix names, or
+/// `None` where the line opens with something else.
+///
+/// Byte-wise throughout, and deliberately: `read_maybe_gzip` decodes the syslog
+/// lossily, which puts a three-byte replacement character where one byte that
+/// was not UTF-8 stood. A `&line[7..13]` taken before the digits are
+/// established lands inside that character and takes the whole pass down with
+/// it — on a parser whose every other answer to a line it cannot read is to
+/// drop the line.
+fn prefix(raw: &[u8]) -> Option<(i64, i64, i64, i64)> {
+    if raw.len() < 13 || raw[6] != b':' {
         return None;
     }
-    let clock = &line[7..13];
-    if !clock.bytes().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let (y, mo, d) = (&line[0..2], &line[2..4], &line[4..6]);
-    let (h, mi, s) = (&clock[0..2], &clock[2..4], &clock[4..6]);
-    let (y, mo, d): (i64, i64, i64) = (
-        2000 + y.parse::<i64>().ok()?,
-        mo.parse().ok()?,
-        d.parse().ok()?,
-    );
+    // The two-digit field at `at`, or `None` where either byte is not a digit.
+    let field = |at: usize| -> Option<i64> {
+        let (tens, units) = (raw[at], raw[at + 1]);
+        (tens.is_ascii_digit() && units.is_ascii_digit())
+            .then(|| ((tens - b'0') * 10 + (units - b'0')) as i64)
+    };
+    let (y, mo, d) = (2000 + field(0)?, field(2)?, field(4)?);
     if !date::is_valid(y, mo, d) {
         return None;
     }
-    let secs =
-        h.parse::<i64>().ok()? * 3600 + mi.parse::<i64>().ok()? * 60 + s.parse::<i64>().ok()?;
+    Some((y, mo, d, field(7)? * 3600 + field(9)? * 60 + field(11)?))
+}
+
+/// `YYMMDD:HHMMSS` at the start of a syslog line.
+pub fn stamp(line: &str) -> Option<Moment> {
+    let (y, mo, d, secs) = prefix(line.as_bytes())?;
+    // `prefix` established bytes 7..13 as ASCII digits, so this slice stands on
+    // a character boundary.
+    let clock = &line[7..13];
+    let day = format!("{y:04}-{mo:02}-{d:02}");
     Some(Moment {
-        day: format!("{y:04}-{mo:02}-{d:02}"),
+        at: format!("{day}T{}:{}:{}", &clock[0..2], &clock[2..4], &clock[4..6]),
+        day,
         secs,
         abs: date::days_from_civil(y, mo, d) * 86_400 + secs,
-        at: format!("{y:04}-{mo:02}-{d:02}T{h}:{mi}:{s}"),
     })
 }
 
 /// The `YYMMDD:HHMMSS` a line begins with, or `None`. The form a watermark
 /// travels in: log prefixes and dump filenames are both this shape, and every
 /// comparison is string ordering with no date arithmetic.
+///
+/// No [`Moment`] is built. This runs on every marker line of every file a pass
+/// opens, and the two `String`s one carries would be dropped unread.
 pub fn line_stamp(line: &str) -> Option<&str> {
-    stamp(line).map(|_| &line[..13])
+    prefix(line.as_bytes()).map(|_| &line[..13])
 }
 
 /// `YYYY-MM-DDTHH:MM:SS` back to the `YYMMDD:HHMMSS` a syslog line starts with.
@@ -359,6 +373,28 @@ mod tests {
         assert!(stamp("260230:101501 cvm[1]: I x").is_none());
         assert!(stamp("not a log line").is_none());
         assert!(stamp("26080").is_none());
+        // A clock that is not one, the date beside it being a real day.
+        assert!(stamp("260807:10x501 cvm[1]: I x").is_none());
+    }
+
+    /// The syslog carries bytes that are not UTF-8 and `read_maybe_gzip`
+    /// decodes it lossily, so a stamp can reach this with a three-byte
+    /// replacement character standing where one bad byte did. Reading it as no
+    /// stamp is the answer; taking the pass down with it is not.
+    #[test]
+    fn a_replacement_character_inside_the_stamp_is_read_as_no_stamp() {
+        let mangled = format!(
+            "260807:1015\u{FFFD}0 cvm[6144]: I {TIMER_MARKER}:Information::NextPage,TotalTime:1;"
+        );
+        assert!(stamp(&mangled).is_none());
+        assert!(line_stamp(&mangled).is_none());
+        // The same character across each of the fields it can land in.
+        for at in [0, 2, 4, 7, 9, 11] {
+            let mut mangled = String::from("260807:101501 cvm[1]: I x");
+            mangled.replace_range(at..at + 1, "\u{FFFD}");
+            assert!(stamp(&mangled).is_none(), "{at}: {mangled}");
+            assert!(line_stamp(&mangled).is_none(), "{at}: {mangled}");
+        }
     }
 
     #[test]
