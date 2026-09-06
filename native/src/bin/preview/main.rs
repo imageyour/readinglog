@@ -281,14 +281,7 @@ fn open(store: &Store, opts: &Opts, w: u32, h: u32, lang: Lang, size: TextSize) 
     }
     let theme = Theme::sized(w, h, size);
     let text = TextRenderer::load(theme.body_px).context(FONTS)?;
-    // The preview renders to a PNG; nothing transforms input against
-    // this, so the native orientation is the honest stand-in.
-    let mut app = App::new(
-        store.clone(),
-        theme,
-        text,
-        readinglog_native::orientation::Orientation::Up,
-    );
+    let mut app = App::new(store.clone(), theme, text);
     app.set_clock(opts.day, NOW);
     app.set_language(lang);
     app.set_text_size(size);
