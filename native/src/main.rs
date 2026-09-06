@@ -166,7 +166,7 @@ fn show() -> Result<()> {
         let _ = ui::splash::show(&mut fb, &mut text, &theme, &said, false);
     });
 
-    let mut app = app::App::new(store, theme, text);
+    let mut app = app::App::new(store, theme, text, orientation);
     eprintln!("stats: {}", app.counted(lang::Lang::English.strings()));
     app.run(&mut fb, &mut input)
 }

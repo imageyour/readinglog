@@ -15,6 +15,7 @@ use crate::eink::input::{Input, InputEvent};
 use crate::eink::screenshot;
 use crate::eink::touch::{SwipeDir, TouchEvent, classify_swipe};
 use crate::lang::Lang;
+use crate::orientation::Orientation;
 use crate::settings::Settings;
 use crate::stats::Stats;
 use crate::ui::chrome::{self, Tab};
@@ -26,6 +27,11 @@ use crate::view::{self, Ctx, Hit, State};
 
 /// The shortest time between two repaints of the update banner.
 const BANNER_REDRAW: Duration = Duration::from_millis(700);
+
+/// The shortest time between two orientation probes. Each spawns
+/// `lipc-get-prop`, and a drag or a held page button can land events far
+/// faster than anyone rotates a device — see [`App::reorient`].
+const PROBE_EVERY: Duration = Duration::from_secs(1);
 
 /// How long an update's last word stays up. A tap ends it sooner.
 const OUTCOME_LINGER: Duration = Duration::from_secs(12);
@@ -47,13 +53,26 @@ pub struct App {
     /// Where the record and the archives beside it live.
     dir: std::path::PathBuf,
     /// The framework orientation the input devices are transforming against.
-    orientation: crate::orientation::Orientation,
+    orientation: Orientation,
+    /// When [`App::reorient`] last spawned a probe, `None` before the first.
+    probed_at: Option<Instant>,
     /// Where every touchable thing was on the last frame.
     hits: Vec<(Hit, crate::ui::paint::Rect)>,
 }
 
 impl App {
-    pub fn new(store: crate::store::Store, theme: Theme, text: TextRenderer) -> Self {
+    /// `orientation` is the one [`show`](crate::show) already opened the touch
+    /// and bezel devices against, handed on rather than detected again: two
+    /// probes with a whole log collection between them can disagree, and the
+    /// app would then hold one orientation while the input devices transform
+    /// against the other, with nothing to reconcile them — [`App::reorient`]
+    /// acts on a change and sees none.
+    pub fn new(
+        store: crate::store::Store,
+        theme: Theme,
+        text: TextRenderer,
+        orientation: Orientation,
+    ) -> Self {
         let (today, now) = date::now();
         let settings = Settings::load(Lang::detect());
         let stats = Stats::build(&store, today, settings.show_unnamed);
@@ -75,9 +94,9 @@ impl App {
             stats,
             colour,
             dir: std::path::PathBuf::from(crate::store::STORE_DIR),
-            // Detected here as `Lang` and `has_cfa` are, and re-read on the
-            // idle tick: the framework can flip the panel while this is open.
-            orientation: crate::orientation::Orientation::detect(),
+            orientation,
+            // Never probed: the first input event may.
+            probed_at: None,
             state: State::new(today),
             today,
             now,
@@ -438,8 +457,24 @@ impl App {
     /// every touch on it mirrored, with the two bezel buttons the wrong way
     /// round. Nothing is redrawn: the frame on the panel is already correct,
     /// and a full refresh here would flash for no reason.
+    ///
+    /// Called when input arrives and never on the idle tick.
+    /// [`Orientation::detect`] spawns `lipc-get-prop`, and a probe every tick
+    /// is two processes a second for as long as the page sits open — on a
+    /// device that otherwise costs nothing at all to leave showing a static
+    /// image. Orientation is read only to interpret input, so probing as input
+    /// arrives is both where it matters and free while nothing is happening.
+    ///
+    /// The event that prompts the probe was itself transformed against the old
+    /// orientation, so the first touch after a flip still lands wrong and
+    /// every one after it lands right. [`PROBE_EVERY`] keeps a fast series of
+    /// taps from spawning a process apiece.
     fn reorient(&mut self, input: &mut Input) {
-        let now = crate::orientation::Orientation::detect();
+        if self.probed_at.is_some_and(|at| at.elapsed() < PROBE_EVERY) {
+            return;
+        }
+        self.probed_at = Some(Instant::now());
+        let now = Orientation::detect();
         if now != self.orientation {
             eprintln!("orientation: {:?} -> {now:?}", self.orientation);
             self.orientation = now;
@@ -477,6 +512,10 @@ impl App {
                         }
                         Action::Nothing => {}
                     }
+                    // After the gesture and not before it: `down` and `up` are
+                    // classified in one frame or the swipe between them is
+                    // measured across two.
+                    self.reorient(input);
                 }
                 // `eink::touch` raises this under an `EVIOCGRAB`.
                 InputEvent::Touch(TouchEvent::Screenshot) => {
@@ -490,12 +529,12 @@ impl App {
                     if let Action::Redraw = self.paged(1) {
                         self.draw(fb)?;
                     }
+                    self.reorient(input);
                 }
                 InputEvent::Tick => {
-                    // The idle tick bounds how quickly a rotation reaches this
-                    // — see `eink::input::TICK_MS`.
-                    self.reorient(input);
-                    // `pump_events` reports a repaint request.
+                    // `pump_events` reports a repaint request. Nothing is
+                    // probed here: an idle page costs one `poll` per tick and
+                    // no process at all — see `App::reorient`.
                     if fb.pump_events() {
                         self.draw(fb)?;
                     }
