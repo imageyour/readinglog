@@ -10,10 +10,14 @@ use std::time::Duration;
 
 /// Names the software making the request. GitHub's API rejects a request
 /// carrying no `User-Agent`.
+///
+/// `concat!` takes literals only, so this spells the project out a second
+/// time; `the_user_agent_names_the_software_and_resolves` holds it to [`REPO`],
+/// and a fork has to move both.
 pub const USER_AGENT: &str = concat!(
     "readinglog/",
     env!("CARGO_PKG_VERSION"),
-    " (+https://github.com/huangziwei/readinglog)"
+    " (+https://github.com/imageyour/readinglog)"
 );
 
 /// Time to a connection.
