@@ -40,6 +40,12 @@ env:
     UPSTREAM_URL: https://github.com/huangziwei/readinglog.git
     BRANCH: fixes/main
     TARGET: armv7-unknown-linux-musleabihf
+    # Pin every `gh` call to this fork. Without it `gh` reads the checkout's
+    # remotes, finds the `upstream` one added below, and resolves a fork to
+    # its parent — so `gh release create` addresses the author's repository
+    # instead of this one. The token has no write there and it fails with a
+    # 403, but permissions are not where this should be decided.
+    GH_REPO: ${{ github.repository }}
 
 jobs:
     sync:
