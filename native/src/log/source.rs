@@ -221,7 +221,7 @@ fn take_events(
         }
         // `raw` carries bytes that are not UTF-8.
         let line = String::from_utf8_lossy(&raw);
-        if !super::MARKERS.iter().any(|m| line.contains(m)) {
+        if !super::marked(&line) {
             continue;
         }
         // A line `line_stamp` cannot read is kept.
