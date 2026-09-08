@@ -393,6 +393,15 @@ fn fetch(
         eprintln!("update: {e}");
         return Err(match e {
             http::Error::Cancelled => None,
+            // A host that was never reached did not send half a file. The
+            // asset redirects to `release-assets.githubusercontent.com`,
+            // which a network can fail to reach while `api.github.com` — the
+            // host that just answered with the release list — is fine, so
+            // this is the failure a device is most likely to see. Calling it
+            // a bad download sends someone to a web page to fetch a file
+            // their network cannot fetch either. `available` already reads
+            // the same error as `NoAnswer`.
+            http::Error::Unreachable(_) => Some(Failure::NoAnswer),
             _ => Some(Failure::BadDownload),
         });
     }
