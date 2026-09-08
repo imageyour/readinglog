@@ -20,12 +20,21 @@ pub const USER_AGENT: &str = concat!(
     " (+https://github.com/imageyour/readinglog)"
 );
 
-/// Time to a connection.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Time to a connection. Generous: the asset redirects off `github.com` to a
+/// CDN, so a download opens two connections, and the device does its TLS in
+/// software — `rustls-rustcrypto` carries no assembly, which is the price of
+/// a build that cross-compiles at all.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Time to the response head. A quiet socket past this is not coming back.
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Whole-body time for the release asset.
 const BODY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Attempts at the asset before giving up. The release list is asked for once
+/// — a device that cannot reach `api.github.com` has nothing to retry for —
+/// but the CDN behind the asset times out on a network that reaches the API
+/// perfectly well, and it does not do so every time.
+const ASSET_TRIES: u32 = 3;
 
 /// Refuse a release list larger than this. Thirty releases run to ~100 KB.
 const MAX_TEXT: u64 = 4 * 1024 * 1024;
@@ -51,7 +60,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Unreachable(e) => write!(f, "cannot reach github.com: {e}"),
+            Error::Unreachable(e) => write!(f, "unreachable: {e}"),
             Error::Status { code, url } => write!(f, "github.com returned {code} for {url}"),
             Error::Body(e) => write!(f, "unreadable response: {e}"),
             Error::Cancelled => write!(f, "cancelled"),
@@ -127,7 +136,37 @@ impl Client {
     /// A release asset, straight to `dest`. `progress` takes the bytes
     /// transferred and the declared length. A partial file is removed on
     /// failure.
+    ///
+    /// Asked for up to [`ASSET_TRIES`] times, and only where the host went
+    /// unreached: a refusal or a body that would not read is an answer, and
+    /// asking again gets the same one. Each try starts from nothing — the
+    /// partial file is already gone — so this re-fetches rather than resumes.
     pub fn download(
+        &self,
+        url: &str,
+        dest: &Path,
+        cancel: &AtomicBool,
+        progress: &dyn Fn(u64, Option<u64>),
+    ) -> Result<u64> {
+        for try_at in 1..ASSET_TRIES {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled);
+            }
+            match self.fetch(url, dest, cancel, progress) {
+                Err(e @ Error::Unreachable(_)) => {
+                    eprintln!("update: {e} — try {try_at} of {ASSET_TRIES}");
+                }
+                done => return done,
+            }
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Cancelled);
+        }
+        self.fetch(url, dest, cancel, progress)
+    }
+
+    /// One attempt at the asset.
+    fn fetch(
         &self,
         url: &str,
         dest: &Path,
@@ -205,13 +244,40 @@ fn classify(e: ureq::Error, url: &str) -> Error {
         // Everything else — DNS, refused connection, TLS failure, timeout —
         // is the device not being able to reach GitHub, which is the one
         // distinction the banner acts on.
-        other => Error::Unreachable(other.to_string()),
+        // Named, because the log said "cannot reach github.com" for what was
+        // a timeout against the CDN the asset redirects to, and that is how
+        // it was first misread. This is the URL asked for, not the one that
+        // timed out: ureq follows the redirect itself and hands back no
+        // response to read the final host off, so the hop is left implied.
+        other => Error::Unreachable(format!("{other} for {url}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nothing listens on port 1, so it refuses at once: this measures the
+    /// number of tries rather than the timeouts.
+    const REFUSED: &str = "http://127.0.0.1:1/asset.zip";
+
+    #[test]
+    fn an_unreached_host_is_asked_again_and_then_given_up_on() {
+        let dest = std::env::temp_dir().join("rl-retry-test.zip");
+        let cancel = AtomicBool::new(false);
+        let got = Client::new().download(REFUSED, &dest, &cancel, &|_, _| {});
+        assert!(matches!(got, Err(Error::Unreachable(_))), "{got:?}");
+        assert!(!dest.exists(), "a failed download left a file behind");
+    }
+
+    /// A tap before the first try, and nothing is asked for at all.
+    #[test]
+    fn a_cancel_is_answered_without_asking() {
+        let dest = std::env::temp_dir().join("rl-cancel-test.zip");
+        let cancel = AtomicBool::new(true);
+        let got = Client::new().download(REFUSED, &dest, &cancel, &|_, _| {});
+        assert!(matches!(got, Err(Error::Cancelled)), "{got:?}");
+    }
 
     #[test]
     fn the_user_agent_names_the_software_and_resolves() {
