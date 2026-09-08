@@ -23,7 +23,7 @@ pub struct Moment {
 /// The day and the seconds into it that a `YYMMDD:HHMMSS` prefix names, or
 /// `None` where the line opens with something else.
 ///
-/// Byte-wise throughout, and deliberately: `read_maybe_gzip` decodes the syslog
+/// Byte-wise throughout, and deliberately: `take_events` decodes each line
 /// lossily, which puts a three-byte replacement character where one byte that
 /// was not UTF-8 stood. A `&line[7..13]` taken before the digits are
 /// established lands inside that character and takes the whole pass down with
@@ -377,7 +377,7 @@ mod tests {
         assert!(stamp("260807:10x501 cvm[1]: I x").is_none());
     }
 
-    /// The syslog carries bytes that are not UTF-8 and `read_maybe_gzip`
+    /// The syslog carries bytes that are not UTF-8 and `take_events`
     /// decodes it lossily, so a stamp can reach this with a three-byte
     /// replacement character standing where one bad byte did. Reading it as no
     /// stamp is the answer; taking the pass down with it is not.
