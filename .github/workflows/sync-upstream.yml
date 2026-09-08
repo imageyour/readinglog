@@ -1,0 +1,327 @@
+# Sync — rebase this fork's patches onto upstream, then publish a release the
+# Kindle's own updater can find.
+#
+# `update::REPO` points the device at this fork, so a build reaches the Kindle
+# only once it is published here. This runs the whole thing by hand would be:
+# look at upstream, rebase `fixes/main`, gate it, build the device tree, cut a
+# release, and report.
+#
+# Nothing is ever pushed to upstream. The only remote written to is this one.
+
+name: Sync upstream
+
+on:
+    schedule:
+        # 03:17 UTC daily. Off the hour deliberately: GitHub queues scheduled
+        # runs heavily on it, and one that cannot be queued is dropped rather
+        # than delayed.
+        - cron: "17 3 * * *"
+    workflow_dispatch:
+        inputs:
+            release_anyway:
+                description: "Build and release even when upstream has nothing new"
+                type: boolean
+                default: false
+
+# Pushing the branch, the tag and the release; an issue is how a failure
+# reaches a person who is not watching the Actions tab.
+permissions:
+    contents: write
+    issues: write
+
+# Never two at once: both would rebase and force-push the same branch. Not
+# cancel-in-progress — a run interrupted between the push and the release
+# leaves a branch with no build against it.
+concurrency:
+    group: sync-upstream
+    cancel-in-progress: false
+
+env:
+    UPSTREAM_URL: https://github.com/huangziwei/readinglog.git
+    BRANCH: fixes/main
+    TARGET: armv7-unknown-linux-musleabihf
+    # Pin every `gh` call to this fork. Without it `gh` reads the checkout's
+    # remotes, finds the `upstream` one added below, and resolves a fork to
+    # its parent — so `gh release create` addresses the author's repository
+    # instead of this one. The token has no write there and it fails with a
+    # 403, but permissions are not where this should be decided.
+    GH_REPO: ${{ github.repository }}
+
+jobs:
+    sync:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  ref: fixes/main
+                  # A rebase needs the whole history and every tag, not a
+                  # shallow tip.
+                  fetch-depth: 0
+
+            - name: Identify the committer
+              run: |
+                  git config user.name "github-actions[bot]"
+                  git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            # `upstream` is added fetch-only. Its push URL is a string that is
+            # not a repository, so a stray `git push upstream` fails loudly
+            # instead of reaching the author.
+            - name: Look at upstream
+              id: look
+              run: |
+                  git remote add upstream "$UPSTREAM_URL"
+                  git remote set-url --push upstream DISABLED_DO_NOT_PUSH_TO_UPSTREAM
+                  git fetch upstream --tags --force
+
+                  behind=$(git rev-list --count HEAD..upstream/main)
+                  ahead=$(git rev-list --count upstream/main..HEAD)
+                  echo "behind=$behind" >> "$GITHUB_OUTPUT"
+                  echo "ahead=$ahead" >> "$GITHUB_OUTPUT"
+                  echo "was=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+                  echo "upstream_head=$(git rev-parse --short upstream/main)" >> "$GITHUB_OUTPUT"
+
+                  # The upstream commits this sync would take on, for the
+                  # release notes.
+                  git log --format='- %h %s' HEAD..upstream/main > "$RUNNER_TEMP/incoming.md"
+
+                  echo "behind $behind, ahead $ahead"
+
+            - name: Nothing to do
+              if: steps.look.outputs.behind == '0' && !inputs.release_anyway
+              run: |
+                  {
+                    echo "## Already current"
+                    echo
+                    echo "\`$BRANCH\` carries **${{ steps.look.outputs.ahead }}** patches on top of"
+                    echo "upstream \`${{ steps.look.outputs.upstream_head }}\`, and upstream has nothing new."
+                    echo
+                    echo "No rebase, no build, no release."
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+            # Everything below is skipped on an already-current fork.
+            - name: Rebase the patches onto upstream
+              id: rebase
+              if: steps.look.outputs.behind != '0' || inputs.release_anyway
+              run: |
+                  if git rebase upstream/main; then
+                    echo "clean=true" >> "$GITHUB_OUTPUT"
+                    echo "now=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
+                  # A conflict needs a person. Record which files, put the
+                  # tree back, and let the failure steps report it.
+                  echo "clean=false" >> "$GITHUB_OUTPUT"
+                  git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt" || true
+                  git rebase --abort || true
+                  echo "::error::rebase onto upstream/main hit conflicts"
+                  exit 1
+
+            - name: Install the cross target
+              if: steps.rebase.outputs.clean == 'true'
+              run: rustup target add "$TARGET"
+
+            - uses: Swatinem/rust-cache@v2
+              if: steps.rebase.outputs.clean == 'true'
+              with:
+                  key: sync-armv7
+
+            # The same three commands `ci.yml` runs. A rebase that merges
+            # cleanly can still be wrong: upstream may have reworked something
+            # a patch here also touches, and only the tests say so.
+            - name: Format, lint, test
+              if: steps.rebase.outputs.clean == 'true'
+              run: |
+                  cargo fmt --all --check
+                  cargo clippy --workspace --all-targets -- -D warnings
+                  cargo test --workspace
+
+            # `X.Y.Z+fork.N`, where `X.Y.Z` is upstream's own version and N
+            # counts the builds cut from it. `update::numbers` splits a version
+            # on `.` and reads the leading digits of each part, so this orders
+            # as [X, Y, Z, N]: newer than plain `X.Y.Z`, newer than `fork.N-1`,
+            # older than upstream's next `X.Y.Z+1`, and — the one that matters
+            # — not newer than itself, or the Kindle would reinstall it on
+            # every check forever.
+            - name: Name this build
+              id: version
+              if: steps.rebase.outputs.clean == 'true'
+              run: |
+                  base=$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0}
+                              f && /^version *=/{gsub(/[" ]/,""); sub(/^version=/,""); print; exit}' \
+                      Cargo.toml)
+                  [ -n "$base" ] || { echo "error: no version in [workspace.package]" >&2; exit 1; }
+
+                  # The highest fork build already cut from this base, if any.
+                  last=$(git tag -l "v$base+fork.*" | sed 's/.*+fork\.//' | sort -n | tail -1)
+                  n=$(( ${last:-0} + 1 ))
+                  version="$base+fork.$n"
+
+                  echo "base=$base" >> "$GITHUB_OUTPUT"
+                  echo "version=$version" >> "$GITHUB_OUTPUT"
+                  echo "tag=v$version" >> "$GITHUB_OUTPUT"
+                  echo "upstream $base -> this build $version"
+
+            # Written into Cargo.toml but never committed: the branch keeps
+            # upstream's own version, which is what makes the next rebase a
+            # clean one. `env!("CARGO_PKG_VERSION")` bakes it into the binary,
+            # so the installed copy reports the version its release is tagged
+            # with and the updater can tell it is current.
+            - name: Stamp the version into the build
+              if: steps.rebase.outputs.clean == 'true'
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+                  BASE: ${{ steps.version.outputs.base }}
+              run: |
+                  awk -v base="$BASE" -v version="$VERSION" '
+                      /^\[workspace\.package\]/ { f=1 }
+                      /^\[/ && !/^\[workspace\.package\]/ { f=0 }
+                      f && $0 ~ "^version *= *\"" base "\"" {
+                          print "version = \"" version "\""; next
+                      }
+                      { print }
+                  ' Cargo.toml > Cargo.toml.new
+                  mv Cargo.toml.new Cargo.toml
+                  grep -m1 '^version' Cargo.toml
+                  # Keep the lockfile agreeing with it, offline.
+                  cargo update --workspace --offline
+
+            - name: Build the device tree
+              if: steps.rebase.outputs.clean == 'true'
+              run: ./build.sh
+
+            # The archive `update::is_asset` looks for, and the `.sha256`
+            # sidecar it checks the download against. Laid out exactly as
+            # `release.yml` does it: `extensions/` and `documents/` open at the
+            # archive root, LICENSE beside them.
+            - name: Package
+              id: package
+              if: steps.rebase.outputs.clean == 'true'
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+              run: |
+                  name="readinglog-$VERSION-kindle"
+                  (cd device && zip -qr "$RUNNER_TEMP/$name.zip" extensions documents -x '*.DS_Store')
+                  zip -q "$RUNNER_TEMP/$name.zip" LICENSE
+                  (cd "$RUNNER_TEMP" && sha256sum "$name.zip" > "$name.zip.sha256")
+                  echo "name=$name" >> "$GITHUB_OUTPUT"
+                  ls -lh "$RUNNER_TEMP/$name.zip"
+
+            # The branch moves only once the build it describes is in hand.
+            # `--force-with-lease` is what a rebase needs, and it refuses if
+            # anything reached the branch since the checkout.
+            - name: Push the rebased branch
+              if: steps.rebase.outputs.clean == 'true'
+              run: |
+                  git push --force-with-lease="$BRANCH:${{ steps.look.outputs.was }}" \
+                    origin "HEAD:$BRANCH"
+
+            # `main` is kept at upstream's own tip, carrying nothing, so the
+            # fork's default branch reads as what it is.
+            - name: Move main to upstream's tip
+              if: steps.rebase.outputs.clean == 'true'
+              continue-on-error: true
+              run: git push origin upstream/main:refs/heads/main
+
+            - name: Write the report
+              id: report
+              if: steps.rebase.outputs.clean == 'true'
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+                  BASE: ${{ steps.version.outputs.base }}
+              run: |
+                  {
+                    echo "Upstream **$BASE** with this fork's patches rebased on top."
+                    echo
+                    echo "Install by copying \`extensions/\` and \`documents/\` onto \`/mnt/us\`,"
+                    echo "or let the Kindle fetch it: **Settings → Check for update**."
+                    echo
+                    echo "### Taken from upstream"
+                    echo
+                    if [ -s "$RUNNER_TEMP/incoming.md" ]; then
+                      cat "$RUNNER_TEMP/incoming.md"
+                    else
+                      echo "- nothing new; rebuilt on request"
+                    fi
+                    echo
+                    echo "### Patches carried on top"
+                    echo
+                    git log --format='- %h %s' upstream/main..HEAD
+                    echo
+                    echo "---"
+                    echo
+                    echo "Gate: \`cargo fmt --check\`, \`clippy -D warnings\` and \`cargo test\` all passed."
+                  } > "$RUNNER_TEMP/notes.md"
+                  cat "$RUNNER_TEMP/notes.md" >> "$GITHUB_STEP_SUMMARY"
+
+            # The tag is cut from the pushed commit, and the release from the
+            # tag. `--notes-file` is the same report the summary carries.
+            - name: Publish the release
+              if: steps.rebase.outputs.clean == 'true'
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  TAG: ${{ steps.version.outputs.tag }}
+                  NAME: ${{ steps.package.outputs.name }}
+              run: |
+                  gh release create "$TAG" \
+                    --target "$(git rev-parse HEAD)" \
+                    --title "$TAG" \
+                    --notes-file "$RUNNER_TEMP/notes.md" \
+                    "$RUNNER_TEMP/$NAME.zip" \
+                    "$RUNNER_TEMP/$NAME.zip.sha256"
+                  echo "released $TAG" >> "$GITHUB_STEP_SUMMARY"
+
+            # A scheduled run nobody is watching has to say so somewhere a
+            # person will see. One issue per failure, labelled so they group.
+            - name: Report a failure
+              if: failure()
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+              run: |
+                  {
+                    echo "The scheduled sync onto upstream \`${{ steps.look.outputs.upstream_head }}\` did not finish."
+                    echo
+                    if [ "${{ steps.rebase.outputs.clean }}" = "false" ]; then
+                      echo "**The rebase hit conflicts.** The branch was left untouched —"
+                      echo "\`git rebase --abort\` ran, nothing was pushed, no release was cut."
+                      echo
+                      echo "Conflicting files:"
+                      echo
+                      sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt" 2>/dev/null || echo "- (not recorded)"
+                      echo
+                      echo "Resolve it locally:"
+                      echo
+                      echo '```bash'
+                      echo "git fetch upstream && git rebase upstream/main $BRANCH"
+                      echo '```'
+                    else
+                      echo "The rebase was clean, so the failure is later —"
+                      echo "the gate, the build, or the release. Upstream may have"
+                      echo "reworked something a patch here also touches."
+                      echo
+                      echo "Nothing was released. The branch may or may not have moved;"
+                      echo "the run log says which step stopped."
+                    fi
+                    echo
+                    echo "[Full log]($RUN)"
+                  } > "$RUNNER_TEMP/failure.md"
+
+                  cat "$RUNNER_TEMP/failure.md" >> "$GITHUB_STEP_SUMMARY"
+
+                  # One issue per run of failures, not one a day. A sync that
+                  # fails on Monday fails the same way on Tuesday, and a
+                  # second issue saying so only makes the first easier to
+                  # ignore. Listed and filtered rather than searched: the
+                  # search index lags behind by minutes, `gh issue list` does
+                  # not. Closing the issue is what says it is dealt with, so
+                  # the next failure after that opens a fresh one.
+                  open=$(gh issue list --state open --limit 50 --json number,title \
+                      -q '[.[] | select(.title | startswith("Sync failed")) | .number] | first // empty')
+                  if [ -n "$open" ]; then
+                    gh issue comment "$open" --body-file "$RUNNER_TEMP/failure.md"
+                  else
+                    gh issue create \
+                      --title "Sync failed against upstream ${{ steps.look.outputs.upstream_head }}" \
+                      --body-file "$RUNNER_TEMP/failure.md"
+                  fi || echo "could not report it; the summary above has it"
